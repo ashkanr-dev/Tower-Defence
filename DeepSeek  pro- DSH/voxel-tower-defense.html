@@ -1,0 +1,1468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Voxel Tower Defense</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0b1020; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    font-family: "Courier New", ui-monospace, monospace;
+    color: #eaf6ff; font-size: 14px; line-height: 1.25;
+    pointer-events: none; user-select: none;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+  }
+  #hud .row {
+    background: rgba(8, 14, 28, 0.55);
+    border: 1px solid rgba(120, 170, 220, 0.25);
+    border-radius: 5px;
+    padding: 3px 9px; margin-bottom: 4px;
+    min-width: 128px; white-space: nowrap;
+  }
+  #hud .row b { color: #ffd76a; }
+  #hud .label { opacity: 0.7; font-size: 10px; letter-spacing: 1px; }
+  #hud .bar {
+    display: inline-block; vertical-align: middle; margin-left: 6px;
+    width: 58px; height: 8px; background: rgba(0,0,0,0.55);
+    border: 1px solid rgba(255,255,255,0.25); border-radius: 3px; overflow: hidden;
+  }
+  #hud .bar > div { height: 100%; width: 100%; background: #58d68d; transition: width 0.15s linear; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="row"><span class="label">WAVE</span>&nbsp;<b id="hudWave">1</b></div>
+  <div class="row"><span class="label">GOLD</span>&nbsp;<b id="hudGold">0</b></div>
+  <div class="row"><span class="label">CASTLE</span>&nbsp;<b id="hudCastle">30</b><span class="bar"><div id="hudCastleBar"></div></span></div>
+  <div class="row"><span class="label">DEFEATED</span>&nbsp;<b id="hudDef">0</b></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================
+   *  Small helpers
+   * ============================================================ */
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+  /* ============================================================
+   *  Renderer / scene / camera
+   * ============================================================ */
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.5, 260);
+
+  /* ============================================================
+   *  Shared geometry / materials
+   * ============================================================ */
+  const CUBE = new THREE.BoxGeometry(1, 1, 1);
+  const IDQ = new THREE.Quaternion();
+  const _m4 = new THREE.Matrix4();
+  const _v3 = new THREE.Vector3();
+  const _c = new THREE.Color();
+  const _eul = new THREE.Euler();
+  _eul.order = "YXZ";
+
+  function makeInstanced(items, material) {
+    const mesh = new THREE.InstancedMesh(CUBE, material, items.length);
+    const q = new THREE.Quaternion();
+    const s = new THREE.Vector3(1, 1, 1);
+    const p = new THREE.Vector3();
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      p.set(it.x, it.y, it.z);
+      if (it.rotY) q.setFromAxisAngle(_v3.set(0, 1, 0), it.rotY); else q.copy(IDQ);
+      s.set(it.sx || 1, it.sy || 1, it.sz || 1);
+      _m4.compose(p, q, s);
+      mesh.setMatrixAt(i, _m4);
+      mesh.setColorAt(i, _c.set(it.color !== undefined ? it.color : 0xffffff));
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    return mesh;
+  }
+
+  /* ============================================================
+   *  Deterministic terrain noise
+   * ============================================================ */
+  function hash2(ix, iz, seed) {
+    let n = (ix * 374761393 + iz * 668265263 + seed * 1274126177) | 0;
+    n = Math.imul(n ^ (n >>> 13), 1274126177);
+    n = n ^ (n >>> 16);
+    return (n >>> 0) / 4294967296;
+  }
+  function valueNoise(x, z, seed) {
+    const xi = Math.floor(x), zi = Math.floor(z);
+    let xf = x - xi, zf = z - zi;
+    xf = xf * xf * (3 - 2 * xf); zf = zf * zf * (3 - 2 * zf);
+    const a = hash2(xi, zi, seed), b = hash2(xi + 1, zi, seed);
+    const c = hash2(xi, zi + 1, seed), d = hash2(xi + 1, zi + 1, seed);
+    return a + (b - a) * xf + (c - a) * zf + (a - b - c + d) * xf * zf;
+  }
+  function fbm(x, z) {
+    return valueNoise(x, z, 11) * 0.55 + valueNoise(x * 2.13, z * 2.13, 23) * 0.3 + valueNoise(x * 4.4, z * 4.4, 47) * 0.15;
+  }
+  function terrainHeight(wx, wz) {
+    const n = fbm(wx * 0.16, wz * 0.16);
+    let h = Math.round((n - 0.34) * 4.6);
+    return clamp(h, 0, 4);
+  }
+
+  /* ============================================================
+   *  Path definition & sampling
+   * ============================================================ */
+  const PATH_WP = [
+    [-22, -10], [-6, -10], [-6, 8], [6, 8], [6, 16], [14, 16], [14, 8], [20, 8]
+  ];
+  const RIVER_Z0 = -1, RIVER_Z1 = 3;   // water band on z
+  const PATH_Y = 0.22;                  // feet height on the road
+
+  const pathPos = [];   // Vector3 samples
+  const pathCum = [];   // cumulative distance
+  const pathDir = [];   // unit direction at sample
+  const path2D = [];    // {x, z} for distance queries
+  let pathLen = 0;
+
+  function buildPath() {
+    // dense 2D polyline
+    const raw = [];
+    for (let i = 0; i < PATH_WP.length - 1; i++) {
+      const a = PATH_WP[i], b = PATH_WP[i + 1];
+      const dx = b[0] - a[0], dz = b[1] - a[1];
+      const len = Math.hypot(dx, dz);
+      const steps = Math.max(1, Math.ceil(len / 0.3));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        raw.push([lerp(a[0], b[0], t), lerp(a[1], b[1], t)]);
+      }
+    }
+    // collapse near-duplicate points
+    const pts = [raw[0]];
+    for (let i = 1; i < raw.length; i++) {
+      const p = raw[i], q = pts[pts.length - 1];
+      if (Math.hypot(p[0] - q[0], p[1] - q[1]) > 1e-4) pts.push(p);
+    }
+    path2D.length = 0;
+    pathPos.length = 0; pathCum.length = 0; pathDir.length = 0;
+    let acc = 0;
+    for (let i = 0; i < pts.length; i++) {
+      path2D.push({ x: pts[i][0], z: pts[i][1] });
+      pathPos.push(new THREE.Vector3(pts[i][0], PATH_Y, pts[i][1]));
+      pathCum.push(acc);
+      if (i > 0) acc += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+      pathDir.push(new THREE.Vector3(0, 0, 1));
+    }
+    pathLen = acc;
+    // directions
+    for (let i = 0; i < pts.length; i++) {
+      const a = pathPos[Math.max(0, i - 1)], b = pathPos[Math.min(pts.length - 1, i + 1)];
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const l = Math.hypot(dx, dz) || 1;
+      pathDir[i].set(dx / l, 0, dz / l);
+    }
+  }
+
+  function distToPath(x, z) {
+    let best = Infinity;
+    for (let i = 0; i < path2D.length - 1; i++) {
+      const a = path2D[i], b = path2D[i + 1];
+      const abx = b.x - a.x, abz = b.z - a.z;
+      const apx = x - a.x, apz = z - a.z;
+      const t = clamp((apx * abx + apz * abz) / (abx * abx + abz * abz || 1), 0, 1);
+      const cx = a.x + abx * t, cz = a.z + abz * t;
+      const d = Math.hypot(x - cx, z - cz);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  const _pp = new THREE.Vector3();
+  const _pd = new THREE.Vector3();
+  function pathPointAt(d) {
+    if (d <= 0) { _pp.copy(pathPos[0]); _pd.copy(pathDir[0]); return _pp; }
+    if (d >= pathLen) { _pp.copy(pathPos[pathPos.length - 1]); _pd.copy(pathDir[pathDir.length - 1]); return _pp; }
+    for (let i = 1; i < pathCum.length; i++) {
+      if (pathCum[i] >= d) {
+        const t = (d - pathCum[i - 1]) / (pathCum[i] - pathCum[i - 1] || 1);
+        _pp.lerpVectors(pathPos[i - 1], pathPos[i], t);
+        _pd.copy(pathDir[i - 1]);
+        return _pp;
+      }
+    }
+    _pp.copy(pathPos[pathPos.length - 1]);
+    return _pp;
+  }
+
+  /* ============================================================
+   *  Day -> dusk atmosphere
+   * ============================================================ */
+  const skyDay = new THREE.Color(0x8ec9e8);
+  const skyDusk = new THREE.Color(0x3a2f5c);
+  const sunDay = new THREE.Color(0xfff4dd);
+  const sunDusk = new THREE.Color(0xff8a4d);
+  const hemiSkyDay = new THREE.Color(0xbcd9ff);
+  const hemiSkyDusk = new THREE.Color(0x7a6aa8);
+  const hemiGndDay = new THREE.Color(0x6b5034);
+  const hemiGndDusk = new THREE.Color(0x2c2434);
+  const _sky = new THREE.Color(), _sunC = new THREE.Color(), _hemiC = new THREE.Color(), _hemiG = new THREE.Color();
+
+  scene.fog = new THREE.Fog(0x8ec9e8, 70, 200);
+
+  const hemi = new THREE.HemisphereLight(0xbcd9ff, 0x6b5034, 0.95);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xfff4dd, 1.05);
+  scene.add(sun);
+
+  const starsGeo = new THREE.BufferGeometry();
+  {
+    const n = 320, arr = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, Math.PI * 2), r = rand(90, 160), h = rand(40, 120);
+      arr[i * 3] = Math.cos(a) * r; arr[i * 3 + 1] = h; arr[i * 3 + 2] = Math.sin(a) * r;
+    }
+    starsGeo.setAttribute("position", new THREE.BufferAttribute(arr, 3));
+  }
+  const starsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 1.1, transparent: true, opacity: 0, depthWrite: false });
+  const stars = new THREE.Points(starsGeo, starsMat);
+  scene.add(stars);
+
+  let dayF = 0; // 0 = day, 1 = dusk
+  function updateAtmosphere(dt, t) {
+    dayF = 0.5 - 0.5 * Math.cos(t * 0.045); // slow day<->dusk cycle
+    _sky.copy(skyDay).lerp(skyDusk, dayF);
+    _sunC.copy(sunDay).lerp(sunDusk, dayF);
+    _hemiC.copy(hemiSkyDay).lerp(hemiSkyDusk, dayF);
+    _hemiG.copy(hemiGndDay).lerp(hemiGndDusk, dayF);
+
+    scene.background = _sky;
+    scene.fog.color.copy(_sky);
+    sun.color.copy(_sunC);
+    sun.intensity = lerp(1.05, 0.5, dayF);
+    hemi.color.copy(_hemiC);
+    hemi.groundColor.copy(_hemiG);
+    hemi.intensity = lerp(0.95, 0.45, dayF);
+
+    const elev = lerp(0.95, 0.18, dayF);
+    const az = t * 0.02 + 0.7;
+    sun.position.set(Math.cos(az) * 90, Math.sin(elev * Math.PI / 2) * 120, Math.sin(az) * 90);
+
+    starsMat.opacity = clamp((dayF - 0.55) * 3, 0, 1);
+  }
+
+  /* ============================================================
+   *  World build
+   * ============================================================ */
+  const SIZE = 48, HALF = SIZE / 2;
+  const hmap = [];
+  const isRoad = [];
+  const isWater = [];
+  const terrainCells = [], roadCells = [], bridgeCells = [];
+
+  const ground = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0x4a3a2a }));
+  ground.scale.set(SIZE + 10, 0.8, SIZE + 10);
+  ground.position.set(0, -0.4, 0);
+  scene.add(ground);
+
+  const waterMat = new THREE.MeshLambertMaterial({ color: 0x3f8fd2, transparent: true, opacity: 0.78 });
+  const water = new THREE.Mesh(CUBE, waterMat);
+  water.scale.set(SIZE + 12, 0.16, RIVER_Z1 - RIVER_Z0 + 0.8);
+  water.position.set(0, 0.0, (RIVER_Z0 + RIVER_Z1) / 2);
+  scene.add(water);
+
+  function buildWorld() {
+    // heightmap
+    for (let gz = 0; gz < SIZE; gz++) {
+      hmap[gz] = []; isRoad[gz] = []; isWater[gz] = [];
+      for (let gx = 0; gx < SIZE; gx++) {
+        const wx = gx - HALF + 0.5, wz = gz - HALF + 0.5;
+        hmap[gz][gx] = terrainHeight(wx, wz);
+        isWater[gz][gx] = (wz > RIVER_Z0 - 0.4 && wz < RIVER_Z1 + 0.4);
+        isRoad[gz][gx] = distToPath(wx, wz) < 1.28;
+      }
+    }
+    // castle patch flattened
+    for (let gz = 0; gz < SIZE; gz++) for (let gx = 0; gx < SIZE; gx++) {
+      const wx = gx - HALF + 0.5, wz = gz - HALF + 0.5;
+      if (wx > 19.6 && wx < 24.2 && wz > 5.2 && wz < 10.8) hmap[gz][gx] = 0;
+    }
+    // classify cells
+    for (let gz = 0; gz < SIZE; gz++) for (let gx = 0; gx < SIZE; gx++) {
+      const wx = gx - HALF + 0.5, wz = gz - HALF + 0.5;
+      const r = isRoad[gz][gx], w = isWater[gz][gx];
+      const h = hmap[gz][gx];
+      if (r && w) { bridgeCells.push({ x: wx, z: wz }); continue; }
+      if (r) { roadCells.push({ x: wx, z: wz }); continue; }
+      if (w) { continue; }
+      if (h > 0) terrainCells.push({ x: wx, z: wz, h: h, sy: h, y: h / 2 });
+    }
+
+    // terrain
+    const terrItems = terrainCells.map(c => {
+      const g = clamp(0.35 + (c.h - 1) * 0.16 + rand(0, 0.08), 0.25, 0.75);
+      const col = new THREE.Color().setHSL(0.27 + rand(-0.03, 0.03), 0.5, g);
+      return { x: c.x, y: c.y, z: c.z, sy: c.sy, color: col.getHex() };
+    });
+    const terrMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    scene.add(makeInstanced(terrItems, terrMat));
+
+    // road
+    const roadItems = roadCells.map(c => ({ x: c.x, y: 0.05, z: c.z, sy: 0.12, color: 0x9a7a4f }));
+    scene.add(makeInstanced(roadItems, new THREE.MeshLambertMaterial({ color: 0xffffff })));
+
+    // bridge planks
+    const brItems = bridgeCells.map(c => ({ x: c.x, y: 0.13, z: c.z, sy: 0.1, sx: 1.02, sz: 1.02, color: 0x8a5c32 }));
+    if (brItems.length) scene.add(makeInstanced(brItems, new THREE.MeshLambertMaterial({ color: 0xffffff })));
+    // bridge rails
+    const railItems = [];
+    bridgeCells.forEach(c => {
+      railItems.push({ x: c.x - 0.5, y: 0.35, z: c.z, sx: 0.14, sy: 0.5, sz: 0.14, color: 0x6e4527 });
+      railItems.push({ x: c.x + 0.5, y: 0.35, z: c.z, sx: 0.14, sy: 0.5, sz: 0.14, color: 0x6e4527 });
+    });
+    if (railItems.length) scene.add(makeInstanced(railItems, new THREE.MeshLambertMaterial({ color: 0xffffff })));
+
+    buildProps();
+  }
+
+  /* ============================================================
+   *  Trees / rocks / village / castle / clouds
+   * ============================================================ */
+  function cellFree(wx, wz) {
+    if (wx < -HALF + 1.5 || wx > HALF - 1.5 || wz < -HALF + 1.5 || wz > HALF - 1.5) return false;
+    if (distToPath(wx, wz) < 2.6) return false;
+    if (wz > RIVER_Z0 - 0.6 && wz < RIVER_Z1 + 0.6) return false;
+    if (wx > 18.5 && wx < 25.5 && wz > 4.0 && wz < 12.0) return false; // castle
+    if (wx > -18 && wx < -10 && wz > 11 && wz < 18) return false;      // village
+    return true;
+  }
+
+  function buildProps() {
+    // trees
+    const trunks = [], canopies = [];
+    let placed = 0, guard = 0;
+    while (placed < 70 && guard++ < 4000) {
+      const x = rand(-HALF + 2, HALF - 2), z = rand(-HALF + 2, HALF - 2);
+      if (!cellFree(x, z)) continue;
+      const gx = Math.floor(x + HALF - 0.5), gz = Math.floor(z + HALF - 0.5);
+      const h = (hmap[gz] && hmap[gz][gx]) || 0;
+      const ty = h + 0.5;
+      const sc = rand(0.7, 1.4);
+      trunks.push({ x, y: ty + 0.35 * sc, z, sy: 0.7 * sc, sx: 0.22 * sc, sz: 0.22 * sc, color: 0x6b4a2a, rotY: rand(0, 6) });
+      const g = new THREE.Color().setHSL(0.3 + rand(-0.04, 0.04), 0.55, rand(0.34, 0.5));
+      canopies.push({ x, y: ty + 0.85 * sc, z, sx: 1.15 * sc, sy: 1.05 * sc, sz: 1.15 * sc, color: g.getHex(), rotY: rand(0, 6) });
+      placed++;
+    }
+    scene.add(makeInstanced(trunks, new THREE.MeshLambertMaterial({ color: 0xffffff })));
+    scene.add(makeInstanced(canopies, new THREE.MeshLambertMaterial({ color: 0xffffff })));
+
+    // rocks
+    const rocks = [];
+    for (let i = 0; i < 46; i++) {
+      const x = rand(-HALF + 2, HALF - 2), z = rand(-HALF + 2, HALF - 2);
+      if (!cellFree(x, z)) continue;
+      const gx = Math.floor(x + HALF - 0.5), gz = Math.floor(z + HALF - 0.5);
+      const h = (hmap[gz] && hmap[gz][gx]) || 0;
+      const sc = rand(0.5, 1.6);
+      const g = new THREE.Color().setHSL(0.08, 0.06, rand(0.42, 0.58));
+      rocks.push({ x, y: h + sc * 0.4, z, sx: sc * 0.9, sy: sc * 0.8, sz: sc * 0.9, color: g.getHex(), rotY: rand(0, 6) });
+    }
+    scene.add(makeInstanced(rocks, new THREE.MeshLambertMaterial({ color: 0xffffff })));
+
+    buildVillage();
+    buildCastle();
+    buildClouds();
+  }
+
+  function buildVillage() {
+    const vx = -14, vz = 13;
+    const huts = [
+      { x: vx, z: vz, s: 1.0 },
+      { x: vx + 2.6, z: vz + 0.6, s: 0.8 },
+      { x: vx - 2.4, z: vz + 1.2, s: 0.85 },
+      { x: vx + 1.2, z: vz - 2.4, s: 0.75 },
+      { x: vx - 1.2, z: vz - 2.2, s: 0.9 }
+    ];
+    const wallMat = new THREE.MeshLambertMaterial({ color: 0xc7a06a });
+    const roofMat = new THREE.MeshLambertMaterial({ color: 0x8a4a2a });
+    const doorMat = new THREE.MeshLambertMaterial({ color: 0x4a2f1a });
+    huts.forEach(h => {
+      const gx = Math.floor(h.x + HALF - 0.5), gz = Math.floor(h.z + HALF - 0.5);
+      const hgt = (hmap[gz] && hmap[gz][gx]) || 0;
+      const y = hgt;
+      const s = h.s;
+      const wall = new THREE.Mesh(CUBE, wallMat);
+      wall.scale.set(1.7 * s, 1.4 * s, 1.6 * s); wall.position.set(h.x, y + 0.7 * s, h.z); scene.add(wall);
+      const roof = new THREE.Mesh(CUBE, roofMat);
+      roof.scale.set(2.0 * s, 0.5 * s, 1.9 * s); roof.position.set(h.x, y + 1.65 * s, h.z);
+      roof.rotation.z = 0.35; scene.add(roof);
+      const door = new THREE.Mesh(CUBE, doorMat);
+      door.scale.set(0.5 * s, 0.8 * s, 0.1); door.position.set(h.x, y + 0.4 * s, h.z + 0.81 * s); scene.add(door);
+    });
+    // campfire with animated smoke (handled in loop via chimney list)
+    const campX = vx + 0.4, campZ = vz - 0.6;
+    const fire = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xe25822 }));
+    fire.scale.set(0.7, 0.5, 0.7); fire.position.set(campX, 0.35, campZ); scene.add(fire);
+    const fireCore = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xffd75a, emissive: 0xffaa00 }));
+    fireCore.scale.set(0.4, 0.35, 0.4); fireCore.position.set(campX, 0.55, campZ); scene.add(fireCore);
+    chimneys.push({ x: campX, y: 0.9, z: campZ, ember: true });
+  }
+
+  const chimneys = []; // smoke emitters {x,y,z, ember?}
+
+  function buildCastle() {
+    const stone = new THREE.MeshLambertMaterial({ color: 0x8b93a3 });
+    const stoneDark = new THREE.MeshLambertMaterial({ color: 0x5c6370 });
+    const roof = new THREE.MeshLambertMaterial({ color: 0x7c2d3a });
+    const flag = new THREE.MeshLambertMaterial({ color: 0xd9353a });
+    const g = new THREE.Group();
+    const cx = 22, cz = 8;
+    function box(m, sx, sy, sz, x, y, z, rotY) {
+      const b = new THREE.Mesh(CUBE, m); b.scale.set(sx, sy, sz); b.position.set(x, y, z);
+      if (rotY) b.rotation.y = rotY; g.add(b); return b;
+    }
+    // keep
+    box(stone, 2.4, 3.2, 2.4, cx, 1.6, cz);
+    box(roof, 2.9, 0.5, 2.9, cx, 3.4, cz);
+    // corner towers
+    [[-1, -1], [-1, 1], [1, -1], [1, 1]].forEach(([dx, dz]) => {
+      box(stone, 1.4, 4.2, 1.4, cx + dx * 1.9, 2.1, cz + dz * 1.9);
+      box(roof, 1.8, 0.6, 1.8, cx + dx * 1.9, 4.5, cz + dz * 1.9);
+      box(stoneDark, 1.5, 0.5, 1.5, cx + dx * 1.9, 5.0, cz + dz * 1.9);
+    });
+    // walls
+    box(stone, 5.6, 1.6, 0.6, cx, 0.8, cz - 2.2);
+    box(stone, 5.6, 1.6, 0.6, cx, 0.8, cz + 2.2);
+    box(stone, 0.6, 1.6, 4.4, cx - 2.8, 0.8, cz);
+    // gate (facing path end at -x)
+    box(stone, 0.8, 2.4, 0.9, cx - 2.6, 1.2, cz - 0.9);
+    box(stone, 0.8, 2.4, 0.9, cx - 2.6, 1.2, cz + 0.9);
+    box(stone, 2.6, 0.7, 0.9, cx - 2.6, 2.7, cz);
+    box(stoneDark, 1.8, 1.6, 0.2, cx - 2.9, 0.8, cz); // gate door
+    // flag
+    const pole = box(stoneDark, 0.14, 2.2, 0.14, cx, 4.5, cz);
+    box(flag, 1.0, 0.55, 0.1, cx + 0.5, 5.3, cz);
+    castleGroup = g;
+    scene.add(g);
+  }
+  let castleGroup = null;
+
+  const clouds = [];
+  function buildClouds() {
+    const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    for (let i = 0; i < 6; i++) {
+      const grp = new THREE.Group();
+      const n = 2 + Math.floor(rand(0, 3));
+      for (let j = 0; j < n; j++) {
+        const b = new THREE.Mesh(CUBE, mat);
+        b.scale.set(rand(2, 4.5), rand(0.7, 1.4), rand(1.5, 3));
+        b.position.set(j * 1.6 - n * 0.8, rand(-0.2, 0.2), rand(-1, 1));
+        grp.add(b);
+      }
+      grp.position.set(rand(-60, 60), rand(30, 52), rand(-60, 60));
+      grp.userData.speed = rand(0.4, 1.1);
+      scene.add(grp);
+      clouds.push(grp);
+    }
+  }
+
+  /* ============================================================
+   *  Tower spots
+   * ============================================================ */
+  const spots = [];
+  function buildSpots() {
+    spots.length = 0;
+    for (let gz = 0; gz < SIZE; gz++) for (let gx = 0; gx < SIZE; gx++) {
+      const wx = gx - HALF + 0.5, wz = gz - HALF + 0.5;
+      const d = distToPath(wx, wz);
+      if (d < 2.1 || d > 4.6) continue;
+      if (isWater[gz][gx]) continue;
+      const h = hmap[gz][gx];
+      spots.push({ x: wx, z: wz, y: h, used: false, pathIndex: 0 });
+    }
+    // nearest path sample index
+    spots.forEach(s => {
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < path2D.length; i += 1) {
+        const dd = Math.hypot(s.x - path2D[i].x, s.z - path2D[i].z);
+        if (dd < bd) { bd = dd; bi = i; }
+      }
+      s.pathIndex = bi;
+    });
+    spots.sort((a, b) => a.pathIndex - b.pathIndex);
+  }
+
+  /* ============================================================
+   *  Towers
+   * ============================================================ */
+  const TOWER_TYPES = {
+    arrow:     { cost: 60,  dmg: 8,   interval: 0.34, range: 5.6, color: 0xb57a3f, muzzle: 1.5 },
+    cannon:    { cost: 95,  dmg: 26,  interval: 1.15, range: 6.6, color: 0x3a3f4a, muzzle: 1.6, splash: 2.3 },
+    freeze:    { cost: 80,  dmg: 5,   interval: 0.75, range: 5.6, color: 0x7fd8e8, muzzle: 1.5, slowDur: 1.6, slowFactor: 0.45 },
+    lightning: { cost: 105, dmg: 18,  interval: 0.6,  range: 6.6, color: 0x9a5ae0, muzzle: 1.7, chain: 2, chainRange: 2.6 },
+    flame:     { cost: 70,  dmg: 12,  interval: 0.28, range: 3.3, color: 0xd8482a, muzzle: 1.4, burnDur: 1.5 }
+  };
+  const MAX_TIER = 4;
+  const MAX_TOWERS = 26;
+  const towers = [];
+
+  function buildTurretVisual(type, turret) {
+    const base = new THREE.MeshLambertMaterial({ color: 0x6a6257 });
+    const plinth = new THREE.Mesh(CUBE, base); plinth.scale.set(0.85, 0.5, 0.85); plinth.position.y = 0.25;
+    turret.add(plinth);
+    const col = TOWER_TYPES[type].color;
+    const mat = new THREE.MeshLambertMaterial({ color: col });
+    const mat2 = new THREE.MeshLambertMaterial({ color: 0x2c2c34 });
+    if (type === "arrow") {
+      const body = new THREE.Mesh(CUBE, mat); body.scale.set(0.5, 0.4, 0.5); body.position.y = 0.72; turret.add(body);
+      const bow = new THREE.Mesh(CUBE, mat2); bow.scale.set(0.16, 0.16, 0.9); bow.position.set(0, 0.72, 0.2); turret.add(bow);
+      const bolt = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xd8d8d8 })); bolt.scale.set(0.06, 0.06, 0.7); bolt.position.set(0, 0.72, 0.55); turret.add(bolt);
+    } else if (type === "cannon") {
+      const body = new THREE.Mesh(CUBE, mat2); body.scale.set(0.6, 0.4, 0.6); body.position.y = 0.7; turret.add(body);
+      const barrel = new THREE.Mesh(CUBE, mat); barrel.scale.set(0.3, 0.3, 1.0); barrel.position.set(0, 0.72, 0.6); turret.add(barrel);
+      const muzzle = new THREE.Mesh(CUBE, mat2); muzzle.scale.set(0.34, 0.34, 0.18); muzzle.position.set(0, 0.72, 1.1); turret.add(muzzle);
+    } else if (type === "freeze") {
+      const crystal = new THREE.Mesh(CUBE, mat); crystal.scale.set(0.5, 0.7, 0.5); crystal.position.y = 0.95; turret.add(crystal);
+      const cap = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xeaf7ff })); cap.scale.set(0.56, 0.3, 0.56); cap.position.y = 1.35; turret.add(cap);
+    } else if (type === "lightning") {
+      const coil = new THREE.Mesh(CUBE, mat); coil.scale.set(0.5, 0.55, 0.5); coil.position.y = 0.95; turret.add(coil);
+      const orb = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xffe14d, emissive: 0xffc400 })); orb.scale.set(0.3, 0.3, 0.3); orb.position.y = 1.4; turret.add(orb);
+    } else if (type === "flame") {
+      const body = new THREE.Mesh(CUBE, mat); body.scale.set(0.55, 0.5, 0.55); body.position.y = 0.8; turret.add(body);
+      const nozzle = new THREE.Mesh(CUBE, mat2); nozzle.scale.set(0.34, 0.34, 0.7); nozzle.position.set(0, 0.8, 0.55); turret.add(nozzle);
+    }
+    // tier marker
+    const tierM = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xffd75a, emissive: 0xaa8800 }));
+    tierM.scale.set(0.18, 0.18, 0.18); tierM.position.y = 1.7; tierM.visible = false;
+    turret.add(tierM);
+    turret.userData.tierM = tierM;
+  }
+
+  function createTower(type, x, y, z, tier) {
+    const tt = TOWER_TYPES[type];
+    const group = new THREE.Group();
+    const baseMat = new THREE.MeshLambertMaterial({ color: 0x5b5145 });
+    const base = new THREE.Mesh(CUBE, baseMat); base.scale.set(0.9, 0.5, 0.9); base.position.y = 0.25; group.add(base);
+    const pillar = new THREE.Mesh(CUBE, baseMat); pillar.scale.set(0.5, 1.0, 0.5); pillar.position.y = 0.95; group.add(pillar);
+
+    const turret = new THREE.Group();
+    turret.position.y = 1.1;
+    turret.rotation.order = "YXZ";
+    buildTurretVisual(type, turret);
+    group.add(turret);
+
+    group.position.set(x, y, z);
+    scene.add(group);
+
+    const tower = {
+      type, group, turret,
+      pos: new THREE.Vector3(x, y, z),
+      dmg: tt.dmg, range: tt.range, interval: tt.interval,
+      cd: rand(0, 0.3), target: null, tier: tier || 1, kills: 0,
+      splash: tt.splash || 0, slowDur: tt.slowDur || 0, slowFactor: tt.slowFactor || 0,
+      chain: tt.chain || 0, chainRange: tt.chainRange || 0, burnDur: tt.burnDur || 0,
+      muzzle: tt.muzzle, cost: tt.cost
+    };
+    applyTierVisual(tower);
+    towers.push(tower);
+    return tower;
+  }
+
+  function applyTierVisual(tower) {
+    const m = tower.turret.userData.tierM;
+    if (m) { m.visible = tower.tier > 1; m.position.y = 1.7 + (tower.tier - 2) * 0.16; }
+    const sc = 1 + (tower.tier - 1) * 0.1;
+    tower.turret.scale.set(sc, sc, sc);
+  }
+
+  function upgradeCost(tier) { return 45 + (tier - 1) * 38; }
+
+  function upgradeTower(tower) {
+    tower.tier++;
+    tower.dmg = TOWER_TYPES[tower.type].dmg * Math.pow(1.55, tower.tier - 1);
+    tower.range = TOWER_TYPES[tower.type].range * Math.pow(1.12, tower.tier - 1);
+    tower.interval = TOWER_TYPES[tower.type].interval * Math.pow(0.9, tower.tier - 1);
+    applyTierVisual(tower);
+  }
+
+  const _turretTarget = new THREE.Vector3();
+  function acquireTarget(tower) {
+    let best = null, bd = tower.range;
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (!e.alive) continue;
+      const d = tower.pos.distanceTo(e.group.position);
+      if (d < bd) { bd = d; best = e; }
+    }
+    return best;
+  }
+
+  /* ============================================================
+   *  Enemies
+   * ============================================================ */
+  const ENEMY = {
+    scout: { scale: 0.5,  speed: 2.2, hp: 22,  bounty: 6,  leak: 1, color: 0xe0562f, fly: false },
+    brute: { scale: 0.95, speed: 1.0, hp: 82,  bounty: 13, leak: 2, color: 0x8e44ad, fly: false },
+    wraith:{ scale: 0.55, speed: 2.0, hp: 34,  bounty: 10, leak: 2, color: 0x39c47a, fly: true },
+    boss:  { scale: 1.6,  speed: 0.72, hp: 640, bounty: 120, leak: 8, color: 0xe67e22, fly: false }
+  };
+  const enemies = [];
+  const EYE_MAT = new THREE.MeshLambertMaterial({ color: 0x101014 });
+  const HB_BG_MAT = new THREE.MeshLambertMaterial({ color: 0x1a1a22 });
+
+  function enemyStats(type) {
+    const b = ENEMY[type];
+    const m = 1 + (wave - 1) * 0.12;
+    return {
+      scale: b.scale, speed: b.speed, color: b.color, fly: b.fly,
+      hp: b.hp * m, maxHp: b.hp * m,
+      bounty: Math.round(b.bounty * (1 + (wave - 1) * 0.1)), leak: b.leak
+    };
+  }
+
+  function buildEnemyVisual(e) {
+    const g = new THREE.Group();
+    const s = e.scale;
+    const bodyMat = new THREE.MeshLambertMaterial({ color: e.color });
+    const body = new THREE.Mesh(CUBE, bodyMat);
+    body.scale.set(s, s * 1.05, s * 0.9);
+    body.position.y = s * 0.55;
+    g.add(body);
+    let wings = null;
+    if (e.type === "wraith") {
+      const wm = new THREE.MeshLambertMaterial({ color: 0x2fae6d });
+      const wl = new THREE.Mesh(CUBE, wm); wl.scale.set(s * 1.6, s * 0.16, s * 0.3); wl.position.set(-s * 0.9, s * 0.75, 0); g.add(wl);
+      const wr = new THREE.Mesh(CUBE, wm); wr.scale.set(s * 1.6, s * 0.16, s * 0.3); wr.position.set(s * 0.9, s * 0.75, 0); g.add(wr);
+      wings = { l: wl, r: wr };
+      const eye = new THREE.Mesh(CUBE, EYE_MAT); eye.scale.set(s * 0.5, s * 0.16, s * 0.1); eye.position.set(0, s * 0.7, s * 0.45); g.add(eye);
+    } else {
+      // eyes (front = +z)
+      const el = new THREE.Mesh(CUBE, EYE_MAT); el.scale.set(s * 0.16, s * 0.16, s * 0.06); el.position.set(-s * 0.18, s * 0.6, s * 0.45); g.add(el);
+      const er = new THREE.Mesh(CUBE, EYE_MAT); er.scale.set(s * 0.16, s * 0.16, s * 0.06); er.position.set(s * 0.18, s * 0.6, s * 0.45); g.add(er);
+    }
+    if (e.type === "scout") {
+      const ant = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xffd75a })); ant.scale.set(s * 0.08, s * 0.6, s * 0.08); ant.position.y = s * 1.35; g.add(ant);
+    }
+    if (e.type === "brute") {
+      const hm = new THREE.MeshLambertMaterial({ color: 0x5b2d8e });
+      const h1 = new THREE.Mesh(CUBE, hm); h1.scale.set(s * 0.2, s * 0.6, s * 0.2); h1.position.set(-s * 0.5, s * 1.2, 0); g.add(h1);
+      const h2 = new THREE.Mesh(CUBE, hm); h2.scale.set(s * 0.2, s * 0.6, s * 0.2); h2.position.set(s * 0.5, s * 1.2, 0); g.add(h2);
+      const plate = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0x6a3ea6 })); plate.scale.set(s * 1.05, s * 0.5, s * 0.2); plate.position.set(0, s * 0.5, s * 0.42); g.add(plate);
+    }
+    if (e.type === "boss") {
+      const cm = new THREE.MeshLambertMaterial({ color: 0xffc14d });
+      const crown = new THREE.Mesh(CUBE, cm); crown.scale.set(s * 0.6, s * 0.4, s * 0.3); crown.position.y = s * 1.25; g.add(crown);
+      const spike1 = new THREE.Mesh(CUBE, cm); spike1.scale.set(s * 0.14, s * 0.5, s * 0.14); spike1.position.set(-s * 0.2, s * 1.6, 0); g.add(spike1);
+      const spike2 = new THREE.Mesh(CUBE, cm); spike2.scale.set(s * 0.14, s * 0.5, s * 0.14); spike2.position.set(s * 0.2, s * 1.6, 0); g.add(spike2);
+      const core = new THREE.Mesh(CUBE, new THREE.MeshLambertMaterial({ color: 0xff4d2a, emissive: 0xff2200 })); core.scale.set(s * 0.5, s * 0.5, s * 0.2); core.position.set(0, s * 0.5, s * 0.44); g.add(core);
+    }
+    // health bar
+    const hb = new THREE.Group();
+    const bg = new THREE.Mesh(CUBE, HB_BG_MAT); bg.scale.set(0.72, 0.09, 0.06); bg.position.z = 0.02; hb.add(bg);
+    const fgMat = new THREE.MeshLambertMaterial({ color: 0x58d68d });
+    const fg = new THREE.Mesh(CUBE, fgMat); fg.scale.set(0.72, 0.09, 0.07); fg.position.z = 0.045; hb.add(fg);
+    hb.position.y = s * 1.2 + 0.55;
+    g.add(hb);
+    return { group: g, bodyMat, body, wings, hb, hbFill: fg, hbFillMat: fgMat };
+  }
+
+  function spawnEnemy(type, dist) {
+    const st = enemyStats(type);
+    const e = {
+      type, alive: true, pathDist: dist, flash: 0, slowT: 0, burnT: 0, burnDps: 0,
+      hp: st.hp, maxHp: st.maxHp, speed: st.speed, scale: st.scale, color: st.color,
+      fly: st.fly, bounty: st.bounty, leak: st.leak, flyPhase: rand(0, Math.PI * 2)
+    };
+    const vis = buildEnemyVisual(e);
+    Object.assign(e, vis);
+    pathPointAt(dist);
+    e.group.position.copy(_pp);
+    if (e.fly) e.group.position.y += 1.5 + Math.sin(e.flyPhase) * 0.2;
+    e.group.rotation.y = Math.atan2(_pd.x, _pd.z);
+    scene.add(e.group);
+    enemies.push(e);
+    return e;
+  }
+
+  function removeEnemy(e) {
+    e.alive = false;
+    scene.remove(e.group);
+  }
+
+  function damageEnemy(e, dmg, kind) {
+    if (!e.alive) return;
+    e.hp -= dmg;
+    if (kind !== "burn") {
+      e.flash = 0.14;
+      spawnHitSpark(e.group.position.x, e.group.position.y + e.scale * 0.6, e.group.position.z, e.color);
+    }
+    if (e.hp <= 0) killEnemy(e);
+  }
+
+  function killEnemy(e) {
+    if (!e.alive) return;
+    e.alive = false;
+    gold += e.bounty;
+    defeated++;
+    spawnShards(e);
+    spawnCoins(e);
+    if (e.type === "boss") {
+      spawnSmokeBurst(e.group.position.x, e.group.position.y + 1, e.group.position.z, 22);
+      spawnSparks(e.group.position.x, e.group.position.y + 1, e.group.position.z, 20, 0xffc14d);
+      shake = Math.max(shake, 0.5);
+    } else {
+      spawnSmokeBurst(e.group.position.x, e.group.position.y, e.group.position.z, 4);
+    }
+    scene.remove(e.group);
+  }
+
+  /* ============================================================
+   *  Projectiles
+   * ============================================================ */
+  const projectiles = [];
+  const PROJ_GEO = CUBE;
+  const arrowMat = new THREE.MeshLambertMaterial({ color: 0xd8c9a8 });
+  const arrowTipMat = new THREE.MeshLambertMaterial({ color: 0x8a8a92 });
+  const ballMat = new THREE.MeshLambertMaterial({ color: 0x20232a });
+  const shardMat = new THREE.MeshLambertMaterial({ color: 0xbfefff });
+
+  function makeProjMesh(type) {
+    const g = new THREE.Group();
+    if (type === "arrow") {
+      const shaft = new THREE.Mesh(PROJ_GEO, arrowMat); shaft.scale.set(0.07, 0.07, 0.55); shaft.position.z = 0.1; g.add(shaft);
+      const tip = new THREE.Mesh(PROJ_GEO, arrowTipMat); tip.scale.set(0.1, 0.1, 0.14); tip.position.z = 0.42; g.add(tip);
+    } else if (type === "ball") {
+      const ball = new THREE.Mesh(PROJ_GEO, ballMat); ball.scale.set(0.34, 0.34, 0.34); g.add(ball);
+    } else if (type === "shard") {
+      const sh = new THREE.Mesh(PROJ_GEO, shardMat); sh.scale.set(0.16, 0.16, 0.3); sh.position.z = -0.1; g.add(sh);
+    }
+    return g;
+  }
+
+  function fireProjectile(tower, type, target) {
+    const start = new THREE.Vector3(tower.pos.x, tower.pos.y + tower.muzzle, tower.pos.z);
+    const mesh = makeProjMesh(type);
+    scene.add(mesh);
+    const p = {
+      type, mesh, target, start, pos: start.clone(), vel: new THREE.Vector3(),
+      life: 3, dmg: tower.dmg, tower, vy: 0, grav: 0, flightT: 0.8, grounded: false, splash: tower.splash,
+      slowDur: tower.slowDur, slowFactor: tower.slowFactor
+    };
+    if (type === "ball") {
+      const tx = target.group.position.x, ty = target.group.position.y + target.scale * 0.5, tz = target.group.position.z;
+      p.grav = -26;
+      const dx = tx - start.x, dz = tz - start.z, dy = ty - start.y;
+      const T = p.flightT;
+      p.vel.set(dx / T, (dy - 0.5 * p.grav * T * T) / T, dz / T);
+      p.grounded = false;
+    } else {
+      const sp = type === "shard" ? 13 : 14;
+      const dir = new THREE.Vector3().subVectors(target.group.position, start).normalize();
+      p.vel.copy(dir).multiplyScalar(sp);
+    }
+    projectiles.push(p);
+  }
+
+  function updateProjectiles(dt) {
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const p = projectiles[i];
+      p.life -= dt;
+      if (p.life <= 0) { scene.remove(p.mesh); projectiles.splice(i, 1); continue; }
+
+      if (p.type === "ball") {
+        p.vel.y += p.grav * dt;
+        p.pos.addScaledVector(p.vel, dt);
+        p.mesh.position.copy(p.pos);
+        const tg = p.target && p.target.alive;
+        const tx = tg ? p.target.group.position.x : p.pos.x + p.vel.x;
+        const tz = tg ? p.target.group.position.z : p.pos.z + p.vel.z;
+        if (p.pos.y <= 0.22 || (Math.hypot(p.pos.x - tx, p.pos.z - tz) < 0.7 && p.pos.y < 1.6)) {
+          explode(p);
+          scene.remove(p.mesh); projectiles.splice(i, 1); continue;
+        }
+      } else {
+        // homing arrow / shard
+        if (p.target && p.target.alive) {
+          const desired = _v3.copy(p.target.group.position).sub(p.pos).normalize().multiplyScalar(p.vel.length());
+          p.vel.lerp(desired, clamp(0.18, 0, 1));
+        }
+        p.pos.addScaledVector(p.vel, dt);
+        p.mesh.position.copy(p.pos);
+        // orient front = +z along velocity
+        p.mesh.rotation.order = "YXZ";
+        p.mesh.rotation.y = Math.atan2(p.vel.x, p.vel.z);
+        p.mesh.rotation.x = -Math.atan2(p.vel.y, Math.hypot(p.vel.x, p.vel.z));
+        // hit detection
+        let hit = null;
+        if (p.target && p.target.alive && p.pos.distanceTo(p.target.group.position) < 0.55 + p.target.scale * 0.4) hit = p.target;
+        else {
+          for (let j = 0; j < enemies.length; j++) {
+            const e = enemies[j];
+            if (!e.alive) continue;
+            if (p.pos.distanceTo(e.group.position) < 0.5 + e.scale * 0.4) { hit = e; break; }
+          }
+        }
+        if (hit) {
+          if (p.type === "shard" && p.slowDur > 0) {
+            hit.slowT = Math.max(hit.slowT, p.slowDur);
+            spawnSparks(hit.group.position.x, hit.group.position.y + hit.scale, hit.group.position.z, 6, 0x9fe8ff);
+          }
+          damageEnemy(hit, p.dmg, p.type);
+          scene.remove(p.mesh); projectiles.splice(i, 1); continue;
+        }
+      }
+    }
+  }
+
+  function explode(p) {
+    const x = p.pos.x, y = Math.max(p.pos.y, 0.3), z = p.pos.z;
+    spawnSmokeBurst(x, y, z, 10);
+    spawnSparks(x, y, z, 14, 0xffa040);
+    spawnDebrisBurst(x, y, z, 10, 0x5a5a5a);
+    shake = Math.max(shake, 0.25);
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (!e.alive) continue;
+      const d = e.group.position.distanceTo(_v3.set(x, y, z));
+      if (d < p.splash + e.scale * 0.4) damageEnemy(e, p.dmg, "cannon");
+    }
+  }
+
+  /* ============================================================
+   *  Beams (lightning)
+   * ============================================================ */
+  const beams = [];
+  function hitPoint(e) {
+    return new THREE.Vector3(e.group.position.x, e.group.position.y + e.scale * 0.6, e.group.position.z);
+  }
+  function fireLightning(tower, first) {
+    const from = new THREE.Vector3(tower.pos.x, tower.pos.y + tower.muzzle, tower.pos.z);
+    const pts = [from.clone()];
+    const seen = new Set([first]);
+    let cur = first;
+    damageEnemy(cur, tower.dmg, "lightning");
+    pts.push(hitPoint(cur));
+    for (let k = 0; k < tower.chain; k++) {
+      let next = null, bd = tower.chainRange;
+      for (let i = 0; i < enemies.length; i++) {
+        const e = enemies[i];
+        if (!e.alive || seen.has(e)) continue;
+        const d = cur.group.position.distanceTo(e.group.position);
+        if (d < bd) { bd = d; next = e; }
+      }
+      if (!next) break;
+      seen.add(next);
+      damageEnemy(next, tower.dmg * 0.7, "lightning");
+      pts.push(hitPoint(next));
+      cur = next;
+    }
+    const positions = new Float32Array(pts.length * 3);
+    for (let j = 0; j < pts.length; j++) { positions[j * 3] = pts[j].x; positions[j * 3 + 1] = pts[j].y; positions[j * 3 + 2] = pts[j].z; }
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xbfe9ff, transparent: true, opacity: 0.95 }));
+    line.frustumCulled = false;
+    scene.add(line);
+    beams.push({ line, pts, life: 0.14, maxLife: 0.14, base: from });
+    spawnSparks(from.x, from.y, from.z, 8, 0xbfe9ff);
+  }
+
+  function updateBeams(dt) {
+    for (let i = beams.length - 1; i >= 0; i--) {
+      const b = beams[i];
+      b.life -= dt;
+      if (b.life <= 0) { scene.remove(b.line); b.line.geometry.dispose(); beams.splice(i, 1); continue; }
+      const arr = b.line.geometry.attributes.position.array;
+      const n = b.pts.length;
+      for (let j = 0; j < n; j++) {
+        let px = b.pts[j].x, py = b.pts[j].y, pz = b.pts[j].z;
+        if (j > 0 && j < n - 1) { px += rand(-0.18, 0.18); py += rand(-0.18, 0.18); pz += rand(-0.18, 0.18); }
+        arr[j * 3] = px; arr[j * 3 + 1] = py; arr[j * 3 + 2] = pz;
+      }
+      b.line.geometry.attributes.position.needsUpdate = true;
+      b.line.material.opacity = 0.95 * (b.life / b.maxLife);
+    }
+  }
+
+  /* ============================================================
+   *  Points particle systems (smoke + sparks)
+   * ============================================================ */
+  const VERT = [
+    "attribute float size;",
+    "attribute float alpha;",
+    "attribute vec3 color;",
+    "varying float vAlpha;",
+    "varying vec3 vColor;",
+    "void main(){",
+    "  vAlpha = alpha;",
+    "  vColor = color;",
+    "  vec4 mv = modelViewMatrix * vec4(position, 1.0);",
+    "  gl_PointSize = size * (220.0 / -mv.z);",
+    "  gl_Position = projectionMatrix * mv;",
+    "}"
+  ].join("\n");
+  const FRAG = [
+    "varying float vAlpha;",
+    "varying vec3 vColor;",
+    "void main(){",
+    "  gl_FragColor = vec4(vColor, vAlpha);",
+    "}"
+  ].join("\n");
+
+  function makePointSystem(cap, blending) {
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(cap * 3);
+    const col = new Float32Array(cap * 3);
+    const siz = new Float32Array(cap);
+    const alp = new Float32Array(cap);
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    geo.setAttribute("size", new THREE.BufferAttribute(siz, 1));
+    geo.setAttribute("alpha", new THREE.BufferAttribute(alp, 1));
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: VERT, fragmentShader: FRAG,
+      transparent: true, depthWrite: false, blending
+    });
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    scene.add(pts);
+    const sim = [];
+    for (let i = 0; i < cap; i++) sim.push({ active: false });
+    return { pts, geo, pos, col, siz, alp, sim, cap, cursor: 0 };
+  }
+
+  function spawnPoint(sys, x, y, z, vx, vy, vz, life, size, r, g, b, grav, grow) {
+    const s = sys.sim[sys.cursor];
+    sys.cursor = (sys.cursor + 1) % sys.cap;
+    s.active = true; s.x = x; s.y = y; s.z = z; s.vx = vx; s.vy = vy; s.vz = vz;
+    s.life = life; s.maxLife = life; s.size = size; s.r = r; s.g = g; s.b = b; s.grav = grav || 0; s.grow = !!grow;
+  }
+
+  function updatePointSystem(sys, dt) {
+    const pos = sys.pos, col = sys.col, siz = sys.siz, alp = sys.alp;
+    for (let i = 0; i < sys.cap; i++) {
+      const s = sys.sim[i];
+      if (!s.active) { alp[i] = 0; continue; }
+      s.vy += s.grav * dt;
+      s.x += s.vx * dt; s.y += s.vy * dt; s.z += s.vz * dt;
+      s.life -= dt;
+      if (s.life <= 0) { s.active = false; alp[i] = 0; continue; }
+      const f = clamp(s.life / s.maxLife, 0, 1);
+      pos[i * 3] = s.x; pos[i * 3 + 1] = s.y; pos[i * 3 + 2] = s.z;
+      col[i * 3] = s.r; col[i * 3 + 1] = s.g; col[i * 3 + 2] = s.b;
+      siz[i] = s.grow ? s.size * (1.6 - f * 0.6) : s.size;
+      alp[i] = f;
+    }
+    sys.geo.attributes.position.needsUpdate = true;
+    sys.geo.attributes.color.needsUpdate = true;
+    sys.geo.attributes.size.needsUpdate = true;
+    sys.geo.attributes.alpha.needsUpdate = true;
+  }
+
+  const smokeSys = makePointSystem(1400, THREE.NormalBlending);
+  const sparkSys = makePointSystem(1200, THREE.AdditiveBlending);
+
+  function spawnSmoke(x, y, z, n) {
+    for (let i = 0; i < n; i++) {
+      const g = rand(0.5, 0.72);
+      spawnPoint(smokeSys, x + rand(-0.2, 0.2), y, z + rand(-0.2, 0.2),
+        rand(-0.4, 0.4), rand(0.5, 1.4), rand(-0.4, 0.4),
+        rand(1.4, 2.6), rand(0.5, 1.0), g, g, g, 0, true);
+    }
+  }
+  function spawnSmokeBurst(x, y, z, n) {
+    for (let i = 0; i < n; i++) {
+      const g = rand(0.35, 0.55);
+      spawnPoint(smokeSys, x + rand(-0.4, 0.4), y + rand(-0.2, 0.4), z + rand(-0.4, 0.4),
+        rand(-1.6, 1.6), rand(0.6, 2.4), rand(-1.6, 1.6),
+        rand(0.8, 2.0), rand(0.7, 1.4), g, g, g, 0, true);
+    }
+  }
+  function spawnSparks(x, y, z, n, colHex) {
+    const c = _c.set(colHex);
+    for (let i = 0; i < n; i++) {
+      const sp = rand(0.6, 1.0);
+      spawnPoint(sparkSys, x, y, z,
+        rand(-3, 3), rand(-2.5, 4), rand(-3, 3),
+        rand(0.2, 0.6), rand(0.16, 0.34), c.r, c.g, c.b, -6, false);
+    }
+  }
+  function spawnHitSpark(x, y, z, colHex) {
+    spawnSparks(x, y, z, 4, colHex);
+  }
+
+  /* ============================================================
+   *  Debris (shards + coins)
+   * ============================================================ */
+  const DEBRIS_CAP = 420;
+  const debris = [];
+  const shardColors = [0x8a8a8a, 0x5a5a5a, 0x7a5a3a, 0xc0392b, 0x8e44ad, 0x27ae60, 0xe67e22, 0x2aa0c0, 0xf1c40f];
+  const shardMats = shardColors.map(h => new THREE.MeshLambertMaterial({ color: h }));
+  const coinMat = new THREE.MeshLambertMaterial({ color: 0xf7c531, emissive: 0x664400 });
+  for (let i = 0; i < DEBRIS_CAP; i++) {
+    const m = new THREE.Mesh(CUBE, shardMats[0]);
+    m.visible = false;
+    scene.add(m);
+    debris.push({ m, active: false });
+  }
+  function nearestShardColor(hex) {
+    const c = _c.set(hex);
+    let bi = 0, bd = Infinity;
+    for (let i = 0; i < shardColors.length; i++) {
+      const cc = _c.set(shardColors[i]);
+      const d = Math.abs(cc.r - c.r) + Math.abs(cc.g - c.g) + Math.abs(cc.b - c.b);
+      if (d < bd) { bd = d; bi = i; }
+    }
+    return bi;
+  }
+  function spawnDebrisSlot() {
+    for (let i = 0; i < debris.length; i++) if (!debris[i].active) return debris[i];
+    return null;
+  }
+  function spawnShards(e) {
+    const n = e.type === "boss" ? 34 : (e.type === "brute" ? 18 : 11);
+    const ci = nearestShardColor(e.color);
+    const cx = e.group.position.x, cy = e.group.position.y + e.scale * 0.5, cz = e.group.position.z;
+    for (let i = 0; i < n; i++) {
+      const d = spawnDebrisSlot(); if (!d) break;
+      d.active = true; d.kind = "shard"; d.life = rand(0.7, 1.5); d.grav = -14;
+      d.vx = rand(-4.5, 4.5); d.vy = rand(2.5, 7); d.vz = rand(-4.5, 4.5);
+      d.rx = rand(-8, 8); d.ry = rand(-8, 8); d.rz = rand(-8, 8);
+      const s = rand(0.08, 0.22) * (e.type === "boss" ? 1.4 : 1);
+      d.m.material = shardMats[ci];
+      d.m.scale.set(s, s, s);
+      d.m.position.set(cx + rand(-0.3, 0.3) * e.scale, cy + rand(-0.3, 0.3) * e.scale, cz + rand(-0.3, 0.3) * e.scale);
+      d.m.visible = true;
+    }
+  }
+  function spawnCoins(e) {
+    const n = e.type === "boss" ? 6 : (e.type === "brute" ? 2 : 1);
+    const cx = e.group.position.x, cy = e.group.position.y + e.scale * 0.5, cz = e.group.position.z;
+    for (let i = 0; i < n; i++) {
+      const d = spawnDebrisSlot(); if (!d) break;
+      d.active = true; d.kind = "coin"; d.life = rand(0.7, 1.2); d.grav = -11;
+      d.vx = rand(-2.5, 2.5); d.vy = rand(3.5, 6.5); d.vz = rand(-2.5, 2.5);
+      d.rx = 0; d.ry = 0; d.rz = 0;
+      d.m.material = coinMat;
+      d.m.scale.set(0.2, 0.2, 0.08);
+      d.m.position.set(cx, cy, cz);
+      d.m.visible = true;
+    }
+  }
+  function spawnDebrisBurst(x, y, z, n, colHex) {
+    const ci = nearestShardColor(colHex);
+    for (let i = 0; i < n; i++) {
+      const d = spawnDebrisSlot(); if (!d) break;
+      d.active = true; d.kind = "shard"; d.life = rand(0.6, 1.2); d.grav = -14;
+      d.vx = rand(-4, 4); d.vy = rand(2, 6); d.vz = rand(-4, 4);
+      d.rx = rand(-8, 8); d.ry = rand(-8, 8); d.rz = rand(-8, 8);
+      const s = rand(0.08, 0.2);
+      d.m.material = shardMats[ci]; d.m.scale.set(s, s, s);
+      d.m.position.set(x, y, z); d.m.visible = true;
+    }
+  }
+  function updateDebris(dt) {
+    for (let i = 0; i < debris.length; i++) {
+      const d = debris[i];
+      if (!d.active) continue;
+      d.life -= dt;
+      if (d.life <= 0) { d.active = false; d.m.visible = false; continue; }
+      d.vy += d.grav * dt;
+      d.m.position.x += d.vx * dt; d.m.position.y += d.vy * dt; d.m.position.z += d.vz * dt;
+      d.m.rotation.x += d.rx * dt; d.m.rotation.y += d.ry * dt; d.m.rotation.z += d.rz * dt;
+      if (d.m.position.y < 0.12 && d.vy < 0) { d.vy *= -0.35; d.vx *= 0.6; d.vz *= 0.6; if (Math.abs(d.vy) < 0.6) d.vy = 0; }
+    }
+  }
+
+  /* ============================================================
+   *  Game state
+   * ============================================================ */
+  let wave = 1, gold = 220, castleHp = 30, castleMax = 30, defeated = 0;
+  const MAX_WAVE = 10;
+  let waveQueue = [], spawnIndex = 0, spawnTimer = 0;
+  let shake = 0;
+  let aiTimer = 1.0;
+
+  function composeWave(n) {
+    const q = [];
+    const count = Math.min(8 + n * 3, 56);
+    for (let i = 0; i < count; i++) {
+      const r = Math.random();
+      let t;
+      if (n % 5 === 0 && i === 0) t = "boss";
+      else if (n % 5 === 0) t = r < 0.5 ? "scout" : (r < 0.8 ? "brute" : "wraith");
+      else if (n >= 4 && r < 0.22) t = "wraith";
+      else if (n >= 6 && r < 0.62) t = "brute";
+      else if (n >= 2 && r < 0.5) t = "brute";
+      else t = "scout";
+      q.push(t);
+    }
+    return q;
+  }
+
+  function startWave(n) {
+    wave = n;
+    waveQueue = composeWave(n);
+    spawnIndex = 0;
+    spawnTimer = 0.5;
+  }
+
+  function updateWave(dt) {
+    if (spawnIndex < waveQueue.length) {
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) {
+        if (enemies.length < 50) {
+          spawnEnemy(waveQueue[spawnIndex], 0);
+          spawnIndex++;
+        }
+        spawnTimer = Math.max(0.34, 0.68 - wave * 0.025);
+      }
+    } else if (enemies.length === 0) {
+      gold += 30 + wave * 12;
+      if (wave >= MAX_WAVE) { resetGame(); return; }
+      startWave(wave + 1);
+    }
+  }
+
+  /* ============================================================
+   *  Self-playing AI
+   * ============================================================ */
+  function pickType() {
+    if (wave <= 2) return pick(["arrow", "arrow", "arrow", "flame", "flame", "cannon"]);
+    if (wave <= 4) return pick(["arrow", "arrow", "flame", "cannon", "cannon", "freeze"]);
+    return pick(["arrow", "flame", "cannon", "freeze", "lightning", "lightning", "cannon"]);
+  }
+  function pickSpot() {
+    let vanguard = 0;
+    for (const e of enemies) if (e.alive && e.pathDist > vanguard) vanguard = e.pathDist;
+    const ahead = pathPointAt(Math.min(vanguard + 9, pathLen * 0.92));
+    let best = null, bd = Infinity;
+    for (const s of spots) {
+      if (s.used) continue;
+      const d = (s.x - ahead.x) * (s.x - ahead.x) + (s.z - ahead.z) * (s.z - ahead.z);
+      if (d < bd) { bd = d; best = s; }
+    }
+    return best;
+  }
+  function aiAct() {
+    const cheapest = Math.min(60, 70, 80, 95, 105);
+    const free = spots.filter(s => !s.used).length;
+    if (free > 0 && towers.length < MAX_TOWERS && gold >= cheapest) {
+      const spot = pickSpot();
+      if (spot) {
+        const type = pickType();
+        gold -= TOWER_TYPES[type].cost;
+        spot.used = true;
+        createTower(type, spot.x, spot.y, spot.z, 1);
+        return;
+      }
+    }
+    // upgrade
+    const cands = towers.filter(t => t.tier < MAX_TIER && gold >= upgradeCost(t.tier));
+    if (cands.length) {
+      cands.sort((a, b) => (a.tier - b.tier) || (b.kills - a.kills));
+      const t = cands[0];
+      gold -= upgradeCost(t.tier);
+      upgradeTower(t);
+    }
+  }
+
+  /* ============================================================
+   *  Towers update (fire)
+   * ============================================================ */
+  function updateTowers(dt) {
+    for (let i = 0; i < towers.length; i++) {
+      const t = towers[i];
+      t.cd -= dt;
+      if (!t.target || !t.target.alive || t.pos.distanceTo(t.target.group.position) > t.range) {
+        t.target = acquireTarget(t);
+      }
+      if (!t.target) continue;
+      const tp = t.target.group.position;
+      // aim turret (front = +z)
+      const dx = tp.x - t.pos.x, dy = (tp.y + t.target.scale * 0.5) - (t.pos.y + t.muzzle), dz = tp.z - t.pos.z;
+      t.turret.rotation.y = Math.atan2(dx, dz);
+      t.turret.rotation.x = -Math.atan2(dy, Math.hypot(dx, dz));
+      if (t.cd <= 0) {
+        if (t.type === "flame") {
+          t.target.burnT = Math.max(t.target.burnT, t.burnDur);
+          t.target.burnDps = t.dmg;
+          const mx = t.pos.x, my = t.pos.y + t.muzzle, mz = t.pos.z;
+          const ddx = tp.x - mx, ddz = tp.z - mz, dl = Math.hypot(ddx, ddz) || 1;
+          spawnSparks(mx + ddx / dl * 0.7, my, mz + ddz / dl * 0.7, 3, 0xffa040);
+          spawnSmoke(mx + ddx / dl * 0.9, my, mz + ddz / dl * 0.9, 1);
+        } else if (t.type === "lightning") {
+          fireLightning(t, t.target);
+        } else if (t.type === "cannon") {
+          fireProjectile(t, "ball", t.target);
+        } else if (t.type === "freeze") {
+          fireProjectile(t, "shard", t.target);
+        } else {
+          fireProjectile(t, "arrow", t.target);
+        }
+        t.cd = t.interval;
+      }
+    }
+  }
+
+  /* ============================================================
+   *  Enemies update
+   * ============================================================ */
+  function updateEnemies(dt, t) {
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+      if (!e.alive) continue;
+      let sp = e.speed;
+      if (e.slowT > 0) { e.slowT -= dt; sp *= 0.45; }
+      if (e.burnT > 0) {
+        e.burnT -= dt;
+        damageEnemy(e, e.burnDps * dt, "burn");
+        if (!e.alive) continue;
+      }
+      e.pathDist += sp * dt;
+      if (e.pathDist >= pathLen) {
+        castleHp -= e.leak;
+        spawnDebrisBurst(21, 0.8, 8, 8, 0x8b93a3);
+        spawnSmokeBurst(21, 1.2, 8, 5);
+        if (e.type === "boss") shake = Math.max(shake, 0.55);
+        scene.remove(e.group);
+        e.alive = false;
+        if (castleHp <= 0) { castleHp = 0; resetGame(); return; }
+        continue;
+      }
+      pathPointAt(e.pathDist);
+      e.group.position.copy(_pp);
+      if (e.fly) e.group.position.y += 1.6 + Math.sin(t * 3 + e.flyPhase) * 0.25;
+      e.group.rotation.y = Math.atan2(_pd.x, _pd.z);
+      if (e.wings) {
+        e.wings.l.rotation.x = Math.sin(t * 9) * 0.7;
+        e.wings.r.rotation.x = -Math.sin(t * 9) * 0.7;
+      }
+      // flash
+      if (e.flash > 0) {
+        e.flash -= dt;
+        const f = clamp(e.flash / 0.14, 0, 1);
+        e.bodyMat.emissive.setRGB(f, f, f);
+      } else if (e.bodyMat.emissive.r > 0) {
+        e.bodyMat.emissive.setRGB(0, 0, 0);
+      }
+      // health bar
+      const frac = clamp(e.hp / e.maxHp, 0, 1);
+      e.hbFill.scale.x = 0.72 * frac;
+      e.hbFill.position.x = -(0.72 * (1 - frac)) / 2;
+      e.hbFillMat.color.setHSL(0.33 * frac, 0.9, 0.45);
+      e.hb.quaternion.copy(camera.quaternion);
+    }
+    // cull dead
+    for (let i = enemies.length - 1; i >= 0; i--) if (!enemies[i].alive) enemies.splice(i, 1);
+  }
+
+  /* ============================================================
+   *  Camera director
+   * ============================================================ */
+  const cam = {
+    mode: "orbit", angle: 0.6, cutTimer: 4,
+    focus: new THREE.Vector3(0, 1, 1),
+    eye: new THREE.Vector3(38, 28, 38),
+    eyeDesired: new THREE.Vector3(38, 28, 38),
+    chaseEnemy: null, chaseAnchor: new THREE.Vector3()
+  };
+
+  function pickEnemyToFollow() {
+    let boss = null;
+    for (const e of enemies) if (e.alive && e.type === "boss") boss = e;
+    if (boss) return boss;
+    const r = Math.random();
+    if (r < 0.3) {
+      // centroid of the pack
+      const c = new THREE.Vector3(); let n = 0;
+      for (const e of enemies) if (e.alive) { c.add(e.group.position); n++; }
+      if (n) return { centroid: c.divideScalar(n) };
+    }
+    // vanguard or random
+    let vanguard = null, vd = -1;
+    for (const e of enemies) if (e.alive && e.pathDist > vd) { vd = e.pathDist; vanguard = e; }
+    if (Math.random() < 0.6) return vanguard || pick(enemies);
+    return pick(enemies);
+  }
+
+  function chooseCut() {
+    if (enemies.length > 0 && Math.random() < 0.6) {
+      cam.mode = "chase";
+      const t = pickEnemyToFollow();
+      if (t && t.centroid) { cam.chaseAnchor.copy(t.centroid); cam.chaseEnemy = null; }
+      else cam.chaseEnemy = t;
+    } else {
+      cam.mode = "orbit";
+      cam.chaseEnemy = null;
+    }
+    cam.cutTimer = 5.5 + Math.random() * 4.5;
+  }
+
+  function updateCamera(dt) {
+    cam.cutTimer -= dt;
+    if (cam.cutTimer <= 0) chooseCut();
+    const R = 36, H = 26;
+    if (cam.mode === "orbit") {
+      cam.angle += dt * 0.11;
+      cam.eyeDesired.set(Math.cos(cam.angle) * R, H, Math.sin(cam.angle) * R);
+      cam.focus.lerp(_v3.set(0, 1.5, 1), 1 - Math.exp(-2 * dt));
+    } else {
+      // chase
+      if (cam.chaseEnemy && !cam.chaseEnemy.alive) cam.chaseEnemy = null;
+      if (!cam.chaseEnemy && !cam.chaseAnchor.lengthSq()) { cam.mode = "orbit"; cam.cutTimer = 2; }
+      else {
+        cam.angle += dt * 0.5;
+        const target = cam.chaseEnemy ? cam.chaseEnemy.group.position : cam.chaseAnchor;
+        const dist = cam.chaseEnemy && cam.chaseEnemy.type === "boss" ? 10 : 6.5;
+        const ht = cam.chaseEnemy && cam.chaseEnemy.type === "boss" ? 9 : 5.5;
+        cam.eyeDesired.set(
+          target.x + Math.cos(cam.angle) * dist,
+          target.y + ht,
+          target.z + Math.sin(cam.angle) * dist
+        );
+        cam.focus.lerp(_v3.copy(target), 1 - Math.exp(-3 * dt));
+      }
+    }
+    const k = 1 - Math.exp(-2.2 * dt);
+    cam.eye.lerp(cam.eyeDesired, k);
+    const sx = (Math.random() - 0.5) * shake, sy = (Math.random() - 0.5) * shake, sz = (Math.random() - 0.5) * shake;
+    camera.position.set(cam.eye.x + sx, cam.eye.y + sy, cam.eye.z + sz);
+    camera.lookAt(cam.focus);
+    shake *= Math.exp(-3.5 * dt);
+  }
+
+  /* ============================================================
+   *  HUD
+   * ============================================================ */
+  const hudWave = document.getElementById("hudWave");
+  const hudGold = document.getElementById("hudGold");
+  const hudCastle = document.getElementById("hudCastle");
+  const hudDef = document.getElementById("hudDef");
+  const hudCastleBar = document.getElementById("hudCastleBar");
+  function updateHUD() {
+    hudWave.textContent = wave;
+    hudGold.textContent = Math.floor(gold);
+    hudCastle.textContent = Math.ceil(castleHp);
+    hudCastleBar.style.width = (100 * castleHp / castleMax) + "%";
+    hudCastleBar.style.background = castleHp / castleMax > 0.5 ? "#58d68d" : (castleHp / castleMax > 0.25 ? "#f4c542" : "#e25822");
+    hudDef.textContent = defeated;
+  }
+
+  /* ============================================================
+   *  Reset (restart forever)
+   * ============================================================ */
+  function resetGame() {
+    // clear dynamic entities
+    for (const e of enemies) scene.remove(e.group);
+    enemies.length = 0;
+    for (const p of projectiles) scene.remove(p.mesh);
+    projectiles.length = 0;
+    for (const b of beams) { scene.remove(b.line); b.line.geometry.dispose(); }
+    beams.length = 0;
+    for (const d of debris) { d.active = false; d.m.visible = false; }
+    for (const s of smokeSys.sim) s.active = false;
+    for (const s of sparkSys.sim) s.active = false;
+    for (const t of towers) scene.remove(t.group);
+    towers.length = 0;
+    for (const s of spots) s.used = false;
+
+    castleHp = castleMax;
+    gold = 220;
+    defeated = 0;
+
+    // initial towers (all 5 kinds already built & firing)
+    const types = ["arrow", "flame", "cannon", "freeze", "lightning", "arrow", "cannon", "flame", "arrow"];
+    const chosen = [];
+    for (let k = 0; k < types.length; k++) {
+      const pos = Math.floor((k + 0.5) * (spots.length / types.length));
+      chosen.push(spots[Math.min(pos, spots.length - 1)]);
+    }
+    chosen.forEach((s, i) => { if (!s) return; s.used = true; createTower(types[i % types.length], s.x, s.y, s.z, 1); });
+
+    // first wave already under way
+    startWave(1);
+    for (let k = 0; k < 6 && k < waveQueue.length; k++) {
+      spawnEnemy(waveQueue[k], k * 3.2 + 0.6);
+      spawnIndex = k + 1;
+    }
+    spawnTimer = 0.5;
+  }
+
+  /* ============================================================
+   *  Main loop
+   * ============================================================ */
+  const clock = new THREE.Clock();
+  let tGlobal = 0;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    tGlobal += dt;
+
+    updateAtmosphere(dt, tGlobal);
+
+    // clouds drift
+    for (const c of clouds) {
+      c.position.x += c.userData.speed * dt;
+      if (c.position.x > 70) c.position.x = -70;
+    }
+
+    // village chimney smoke
+    for (const ch of chimneys) {
+      if (Math.random() < 0.5) {
+        if (ch.ember) {
+          spawnPoint(sparkSys, ch.x + rand(-0.15, 0.15), ch.y, ch.z + rand(-0.15, 0.15), rand(-0.2, 0.2), rand(0.8, 1.8), rand(-0.2, 0.2), rand(0.3, 0.7), rand(0.12, 0.22), 1, 0.6, 0.2, -2, false);
+        }
+        spawnPoint(smokeSys, ch.x, ch.y, ch.z, rand(-0.3, 0.3), rand(1.0, 2.0), rand(-0.3, 0.3), rand(1.6, 3.0), rand(0.6, 1.1), 0.5, 0.5, 0.5, 0, true);
+      }
+    }
+
+    updateWave(dt);
+    updateEnemies(dt, tGlobal);
+    updateTowers(dt);
+    updateProjectiles(dt);
+    updateBeams(dt);
+    updateDebris(dt);
+    updatePointSystem(smokeSys, dt);
+    updatePointSystem(sparkSys, dt);
+
+    aiTimer -= dt;
+    if (aiTimer <= 0) { aiTimer = 1.2; aiAct(); }
+
+    updateCamera(dt);
+    updateHUD();
+
+    renderer.render(scene, camera);
+  }
+
+  function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+  window.addEventListener("resize", onResize);
+
+  /* ============================================================
+   *  Boot
+   * ============================================================ */
+  buildPath();
+  buildWorld();
+  buildSpots();
+  resetGame();
+  chooseCut();
+  updateHUD();
+  animate();
+})();
+</script>
+</body>
+</html>
